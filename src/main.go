@@ -3,10 +3,12 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -269,7 +271,7 @@ type GMLLanguageServer struct {
 	shutdownReceived bool
 }
 
-func NewGMLLanguageServer() *GMLLanguageServer {
+func NewGMLLanguageServer(rootPath string) *GMLLanguageServer {
 	server := &GMLLanguageServer{
 		documents: make(map[string]string),
 		keywords:  make(map[string]CompletionItem),
@@ -288,12 +290,87 @@ func NewGMLLanguageServer() *GMLLanguageServer {
 		},
 		shutdownReceived: false,
 	}
-
-	server.initializeCompletions()
+	server.initializeCompletions(rootPath)
 	return server
 }
 
-func (s *GMLLanguageServer) initializeCompletions() {
+func (s *GMLLanguageServer) scanDirectoryForGMLFiles(rootPath string) ([]string, error) {
+	var gmlFiles []string
+	err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() && filepath.Ext(path) == ".gml" {
+			gmlFiles = append(gmlFiles, path)
+		}
+		return nil
+	})
+	return gmlFiles, err
+}
+
+var (
+	varPattern      = regexp.MustCompile(`\bvar\s+([a-zA-Z_][a-zA-Z0-9_]*)\b`)
+	funcPattern     = regexp.MustCompile(`\bfunction\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(`)
+	constantPattern = regexp.MustCompile(`(?:\b#macro\s+|\benum\s+)([a-zA-Z_][a-zA-Z0-9_]*)\b`)
+)
+
+func (s *GMLLanguageServer) parseGMLFile(filePath string) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		log.Printf("Error opening file %s: %v", filePath, err)
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Extract variables
+		varMatches := varPattern.FindAllStringSubmatch(line, -1)
+		for _, match := range varMatches {
+			if len(match) > 1 {
+				variable := match[1]
+				s.variables[variable] = CompletionItem{
+					Label:  variable,
+					Kind:   CompletionItemKindVariable,
+					Detail: "User-defined variable",
+				}
+			}
+		}
+
+		// Extract functions
+		funcMatches := funcPattern.FindAllStringSubmatch(line, -1)
+		for _, match := range funcMatches {
+			if len(match) > 1 {
+				function := match[1]
+				s.functions[function] = CompletionItem{
+					Label:  function,
+					Kind:   CompletionItemKindFunction,
+					Detail: "User-defined function",
+				}
+			}
+		}
+
+		// Extract constants
+		constMatches := constantPattern.FindAllStringSubmatch(line, -1)
+		for _, match := range constMatches {
+			if len(match) > 1 {
+				constant := match[1]
+				s.constants[constant] = CompletionItem{
+					Label:  constant,
+					Kind:   CompletionItemKindConstant,
+					Detail: "User-defined constant",
+				}
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("Error scanning file %s: %v", filePath, err)
+	}
+}
+
+func (s *GMLLanguageServer) initializeCompletions(rootPath string) {
 	// Keywords
 	keywords := []string{
 		"case", "default", "while", "for", "do", "repeat", "until",
@@ -1327,6 +1404,16 @@ func (s *GMLLanguageServer) initializeCompletions() {
 			Detail: "GML built-in variable",
 		}
 	}
+
+	gmlFiles, err := s.scanDirectoryForGMLFiles(rootPath)
+	if err != nil {
+		log.Printf("Error scanning directory: %v", err)
+		return
+	}
+
+	for _, file := range gmlFiles {
+		s.parseGMLFile(file)
+	}
 }
 
 func (s *GMLLanguageServer) handleMessage(msg *Message) *Message {
@@ -1360,6 +1447,22 @@ func (s *GMLLanguageServer) handleMessage(msg *Message) *Message {
 }
 
 func (s *GMLLanguageServer) handleInitialize(msg *Message) *Message {
+	var params InitializeParams
+	paramsBytes, err := json.Marshal(msg.Params)
+	if err != nil {
+		log.Printf("Could not marshal initialize params: %v", err)
+		return &Message{Jsonrpc: "2.0", ID: msg.ID, Error: &RPCError{Code: -32602, Message: "Invalid params"}}
+	}
+	if err := json.Unmarshal(paramsBytes, &params); err != nil {
+		log.Printf("Could not unmarshal initialize params: %v", err)
+		return &Message{Jsonrpc: "2.0", ID: msg.ID, Error: &RPCError{Code: -32602, Message: "Invalid params"}}
+	}
+
+	// Scan directory for GML files and initialize completions
+	if params.RootPath != "" {
+		s.initializeCompletions(params.RootPath)
+	}
+
 	capabilities := ServerCapabilities{
 		TextDocumentSync: 1, // Full sync
 		CompletionProvider: &CompletionOptions{
@@ -1377,7 +1480,6 @@ func (s *GMLLanguageServer) handleInitialize(msg *Message) *Message {
 			Range: false,
 		},
 	}
-
 	return &Message{
 		Jsonrpc: "2.0",
 		ID:      msg.ID,
@@ -1890,7 +1992,10 @@ func (s *GMLLanguageServer) emptyCompletion(msg *Message) *Message {
 }
 
 func main() {
-	server := NewGMLLanguageServer()
+	rootPath := flag.String("root", ".", "Root directory of GML files")
+	flag.Parse()
+
+	server := NewGMLLanguageServer(*rootPath)
 
 	// Redirect log output to a file for debugging
 	f, err := os.OpenFile("/tmp/gml-lsp.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
@@ -1899,11 +2004,9 @@ func main() {
 	}
 	defer f.Close()
 	log.SetOutput(f)
-
 	log.Println("GML Language Server starting...")
 
 	reader := bufio.NewReader(os.Stdin)
-
 	for {
 		// Read Content-Length header
 		line, err := reader.ReadString('\n')
@@ -1913,46 +2016,38 @@ func main() {
 			}
 			return
 		}
-
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "Content-Length:") {
 			log.Printf("Unexpected header: %s", line)
 			continue
 		}
-
 		lengthStr := strings.TrimSpace(strings.TrimPrefix(line, "Content-Length:"))
 		length, err := strconv.Atoi(lengthStr)
 		if err != nil {
 			log.Printf("Could not parse content length: %v", err)
 			continue
 		}
-
 		// Read the empty line separator
 		_, err = reader.ReadString('\n')
 		if err != nil {
 			log.Printf("Error reading separator: %v", err)
 			return
 		}
-
 		// Read message content
 		content := make([]byte, length)
 		if _, err := io.ReadFull(reader, content); err != nil {
 			log.Printf("Could not read content: %v", err)
 			return
 		}
-
 		log.Printf("Received message: %s", string(content))
-
 		// Parse JSON-RPC message
 		var msg Message
 		if err := json.Unmarshal(content, &msg); err != nil {
 			log.Printf("Could not unmarshal message: %v", err)
 			continue
 		}
-
 		// Handle message
 		response := server.handleMessage(&msg)
-
 		// Send response if not nil
 		if response != nil {
 			responseBytes, err := json.Marshal(response)
@@ -1960,7 +2055,6 @@ func main() {
 				log.Printf("Could not marshal response: %v", err)
 				continue
 			}
-
 			log.Printf("Sending response: %s", string(responseBytes))
 			fmt.Printf("Content-Length: %d\r\n\r\n%s", len(responseBytes), responseBytes)
 		}
