@@ -10,7 +10,7 @@ if not configs.gml_lsp then
       cmd = { 'gml_lsp' },
       -- Filetypes this LSP should attach to.
       filetypes = { 'gml' },
-      root_dir = lspconfig.util.root_pattern('.git', '*.yyp'),
+      root_dir = lspconfig.util.root_pattern('.git', '*.yy'),
       settings = {},
       -- Gml lsp server doesn't use init_options, so this can be empty.
       init_options = {}
