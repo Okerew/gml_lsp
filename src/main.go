@@ -370,6 +370,46 @@ func (s *GMLLanguageServer) parseGMLFile(filePath string) {
 	}
 }
 
+func (s *GMLLanguageServer) scanDirectoriesForAssets(rootPath string) map[string]CompletionItem {
+	assetFolders := []string{"sprites", "scripts", "objects", "rooms", "tilesets", "sequences", "particle systems", "sounds", "shaders", "timelines", "fonts"}
+	completions := make(map[string]CompletionItem)
+	for _, folder := range assetFolders {
+		fullPath := filepath.Join(rootPath, "..", "..", folder) // Adjust the path depth as necessary
+		err := filepath.Walk(fullPath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			// Get the relative path from the asset folder
+			relPath, err := filepath.Rel(fullPath, path)
+			if err != nil {
+				return err
+			}
+			// Clean up the path and replace separators for display purposes
+			cleanPath := filepath.ToSlash(relPath)
+			if info.IsDir() {
+				// Add folder to completions
+				completions[cleanPath] = CompletionItem{
+					Label:  cleanPath,
+					Kind:   CompletionItemKindFolder,
+					Detail: fmt.Sprintf("Folder: %s", cleanPath),
+				}
+			} else {
+				// Add file to completions
+				completions[cleanPath] = CompletionItem{
+					Label:  cleanPath,
+					Kind:   CompletionItemKindFile,
+					Detail: fmt.Sprintf("File: %s", cleanPath),
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			log.Printf("Error scanning directory %s: %v", folder, err)
+		}
+	}
+	return completions
+}
+
 func (s *GMLLanguageServer) initializeCompletions(rootPath string) {
 	// Keywords
 	keywords := []string{
@@ -1413,6 +1453,11 @@ func (s *GMLLanguageServer) initializeCompletions(rootPath string) {
 
 	for _, file := range gmlFiles {
 		s.parseGMLFile(file)
+	}
+
+	assetCompletions := s.scanDirectoriesForAssets(rootPath)
+	for label, item := range assetCompletions {
+		s.keywords[label] = item
 	}
 }
 
