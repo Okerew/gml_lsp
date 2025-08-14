@@ -58,7 +58,6 @@ lspconfig.gml_lsp.setup({
               delta = false
             }
           },
-          -- These types and modifiers match what your Go server provides.
           tokenTypes = {
             'namespace', 'type', 'class', 'enum', 'interface', 'struct',
             'typeParameter', 'parameter', 'variable', 'property', 'enumMember',
@@ -110,18 +109,3 @@ vim.api.nvim_create_autocmd("FileType", {
     end
   end,
 })
-
--- Setup nvim-cmp for autocompletion
-local cmp_status, cmp = pcall(require, 'cmp')
-if cmp_status then
-  cmp.setup({
-    sources = cmp.config.sources({
-      { name = 'nvim_lsp', priority = 1000 },
-      { name = 'buffer', priority = 500 },
-      { name = 'path', priority = 250 }
-    }),
-    experimental = {
-      ghost_text = true,
-    }
-  })
-end
