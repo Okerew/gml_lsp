@@ -68,12 +68,28 @@ type WorkspaceFolder struct {
 	Name string `json:"name"`
 }
 
+type DocumentFormattingParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Options      FormattingOptions      `json:"options"`
+}
+
+type FormattingOptions struct {
+	TabSize      int  `json:"tabSize"`
+	InsertSpaces bool `json:"insertSpaces"`
+}
+
+type TextEdit struct {
+	Range   Range  `json:"range"`
+	NewText string `json:"newText"`
+}
+
 type ServerCapabilities struct {
-	TextDocumentSync       int                    `json:"textDocumentSync"`
-	CompletionProvider     *CompletionOptions     `json:"completionProvider,omitempty"`
-	HoverProvider          bool                   `json:"hoverProvider"`
-	DocumentSymbolProvider bool                   `json:"documentSymbolProvider"`
-	SemanticTokensProvider *SemanticTokensOptions `json:"semanticTokensProvider,omitempty"`
+	TextDocumentSync           int                    `json:"textDocumentSync"`
+	CompletionProvider         *CompletionOptions     `json:"completionProvider,omitempty"`
+	HoverProvider              bool                   `json:"hoverProvider"`
+	DocumentSymbolProvider     bool                   `json:"documentSymbolProvider"`
+	SemanticTokensProvider     *SemanticTokensOptions `json:"semanticTokensProvider,omitempty"`
+	DocumentFormattingProvider bool                   `json:"documentFormattingProvider"`
 }
 
 type SemanticTokensOptions struct {
@@ -259,13 +275,13 @@ const (
 	CompletionItemKindTypeParameter = 25
 )
 
-// GML Language Server
 type GMLLanguageServer struct {
 	documents        map[string]string
 	keywords         map[string]CompletionItem
 	functions        map[string]CompletionItem
 	constants        map[string]CompletionItem
 	variables        map[string]CompletionItem
+	objects          map[string]map[string]CompletionItem
 	tokenTypes       []string
 	tokenModifiers   []string
 	shutdownReceived bool
@@ -278,6 +294,7 @@ func NewGMLLanguageServer(rootPath string) *GMLLanguageServer {
 		functions: make(map[string]CompletionItem),
 		constants: make(map[string]CompletionItem),
 		variables: make(map[string]CompletionItem),
+		objects:   make(map[string]map[string]CompletionItem),
 		tokenTypes: []string{
 			"namespace", "type", "class", "enum", "interface", "struct", "typeParameter",
 			"parameter", "variable", "property", "enumMember", "event", "function",
@@ -309,9 +326,11 @@ func (s *GMLLanguageServer) scanDirectoryForGMLFiles(rootPath string) ([]string,
 }
 
 var (
-	varPattern      = regexp.MustCompile(`\bvar\s+([a-zA-Z_][a-zA-Z0-9_]*)\b`)
-	funcPattern     = regexp.MustCompile(`\bfunction\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(`)
-	constantPattern = regexp.MustCompile(`(?:\b#macro\s+|\benum\s+)([a-zA-Z_][a-zA-Z0-9_]*)\b`)
+	varPattern        = regexp.MustCompile(`\bvar\s+([a-zA-Z_][a-zA-Z0-9_]*)\b`)
+	assignmentPattern = regexp.MustCompile(`\b([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*[^=]`)
+	funcPattern       = regexp.MustCompile(`\bfunction\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(`)
+	constantPattern   = regexp.MustCompile(`(?:\b#macro\s+|\benum\s+)([a-zA-Z_][a-zA-Z0-9_]*)\b`)
+	objectPattern     = regexp.MustCompile(`\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\.\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=`)
 )
 
 func (s *GMLLanguageServer) parseGMLFile(filePath string) {
@@ -326,7 +345,7 @@ func (s *GMLLanguageServer) parseGMLFile(filePath string) {
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		// Extract variables
+		// Extract variables from var declarations
 		varMatches := varPattern.FindAllStringSubmatch(line, -1)
 		for _, match := range varMatches {
 			if len(match) > 1 {
@@ -335,6 +354,24 @@ func (s *GMLLanguageServer) parseGMLFile(filePath string) {
 					Label:  variable,
 					Kind:   CompletionItemKindVariable,
 					Detail: "User-defined variable",
+				}
+			}
+		}
+
+		// Extract variables from assignments
+		assignmentMatches := assignmentPattern.FindAllStringSubmatch(line, -1)
+		for _, match := range assignmentMatches {
+			if len(match) > 1 {
+				variable := match[1]
+				// Skip if it's already a keyword or function
+				if _, exists := s.keywords[variable]; !exists {
+					if _, exists := s.functions[variable]; !exists {
+						s.variables[variable] = CompletionItem{
+							Label:  variable,
+							Kind:   CompletionItemKindVariable,
+							Detail: "Variable",
+						}
+					}
 				}
 			}
 		}
@@ -361,6 +398,26 @@ func (s *GMLLanguageServer) parseGMLFile(filePath string) {
 					Label:  constant,
 					Kind:   CompletionItemKindConstant,
 					Detail: "User-defined constant",
+				}
+			}
+		}
+
+		// Extract object properties
+		objectMatches := objectPattern.FindAllStringSubmatch(line, -1)
+		for _, match := range objectMatches {
+			if len(match) > 2 {
+				objectName := match[1]
+				propertyName := match[2]
+
+				// Initialize object if it doesn't exist
+				if s.objects[objectName] == nil {
+					s.objects[objectName] = make(map[string]CompletionItem)
+				}
+
+				s.objects[objectName][propertyName] = CompletionItem{
+					Label:  propertyName,
+					Kind:   CompletionItemKindProperty,
+					Detail: fmt.Sprintf("Property of %s", objectName),
 				}
 			}
 		}
@@ -1485,6 +1542,8 @@ func (s *GMLLanguageServer) handleMessage(msg *Message) *Message {
 		return s.handleHover(msg)
 	case "textDocument/semanticTokens/full":
 		return s.handleSemanticTokens(msg)
+	case "textDocument/formatting":
+		return s.handleFormatting(msg)
 	default:
 		log.Printf("Method not found: %s\n", msg.Method)
 		return nil
@@ -1524,6 +1583,7 @@ func (s *GMLLanguageServer) handleInitialize(msg *Message) *Message {
 			Full:  true,
 			Range: false,
 		},
+		DocumentFormattingProvider: true,
 	}
 	return &Message{
 		Jsonrpc: "2.0",
@@ -1587,6 +1647,67 @@ func (s *GMLLanguageServer) handleDidChange(msg *Message) {
 	log.Printf("Changed document: %s", params.TextDocument.URI)
 }
 
+func (s *GMLLanguageServer) getObjectPropertyCompletions(msg *Message, objectName string) *Message {
+	var items []CompletionItem
+
+	if properties, exists := s.objects[objectName]; exists {
+		for _, item := range properties {
+			items = append(items, item)
+		}
+	}
+
+	// Sort alphabetically
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].Label < items[j].Label
+	})
+
+	return &Message{
+		Jsonrpc: "2.0",
+		ID:      msg.ID,
+		Result: CompletionList{
+			IsIncomplete: false,
+			Items:        items,
+		},
+	}
+}
+
+func (s *GMLLanguageServer) getObjectPropertyCompletionsWithPrefix(msg *Message, objectName, prefix string) *Message {
+	var items []CompletionItem
+	prefix = strings.ToLower(prefix)
+
+	if properties, exists := s.objects[objectName]; exists {
+		for _, item := range properties {
+			if strings.HasPrefix(strings.ToLower(item.Label), prefix) {
+				items = append(items, item)
+			}
+		}
+	}
+
+	// Sort by relevance
+	sort.Slice(items, func(i, j int) bool {
+		aExact := strings.ToLower(items[i].Label) == prefix
+		bExact := strings.ToLower(items[j].Label) == prefix
+
+		if aExact && !bExact {
+			return true
+		}
+		if !aExact && bExact {
+			return false
+		}
+
+		return items[i].Label < items[j].Label
+	})
+
+	return &Message{
+		Jsonrpc: "2.0",
+		ID:      msg.ID,
+		Result: CompletionList{
+			IsIncomplete: false,
+			Items:        items,
+		},
+	}
+}
+
 func (s *GMLLanguageServer) handleCompletion(msg *Message) *Message {
 	var params CompletionParams
 	paramsBytes, _ := json.Marshal(msg.Params)
@@ -1618,15 +1739,45 @@ func (s *GMLLanguageServer) handleCompletion(msg *Message) *Message {
 		return s.emptyCompletion(msg)
 	}
 
-	// Find the word boundary
+	// Check if we're completing after a dot (object property completion)
+	if params.Position.Character > 0 && line[params.Position.Character-1] == '.' {
+		// Find the object name before the dot
+		dotPos := params.Position.Character - 1
+		start := dotPos - 1
+		for start >= 0 && (unicode.IsLetter(rune(line[start])) || unicode.IsDigit(rune(line[start])) || line[start] == '_') {
+			start--
+		}
+		start++ // Move to the first character of the object name
+
+		if start < dotPos {
+			objectName := line[start:dotPos]
+			return s.getObjectPropertyCompletions(msg, objectName)
+		}
+	}
+
+	// Check if we're in the middle of object property completion
+	beforeCursor := line[:params.Position.Character]
+	if dotIndex := strings.LastIndex(beforeCursor, "."); dotIndex != -1 {
+		// Find object name before dot
+		objectStart := dotIndex - 1
+		for objectStart >= 0 && (unicode.IsLetter(rune(line[objectStart])) || unicode.IsDigit(rune(line[objectStart])) || line[objectStart] == '_') {
+			objectStart--
+		}
+		objectStart++
+
+		if objectStart < dotIndex {
+			objectName := line[objectStart:dotIndex]
+			prefix := line[dotIndex+1 : params.Position.Character]
+			return s.getObjectPropertyCompletionsWithPrefix(msg, objectName, prefix)
+		}
+	}
+
 	start := params.Position.Character
 	for start > 0 && (unicode.IsLetter(rune(line[start-1])) || unicode.IsDigit(rune(line[start-1])) || line[start-1] == '_') {
 		start--
 	}
 
 	prefix := line[start:params.Position.Character]
-
-	// Generate completions
 	completions := s.getCompletions(prefix)
 
 	return &Message{
@@ -2034,6 +2185,190 @@ func (s *GMLLanguageServer) emptyCompletion(msg *Message) *Message {
 			Items:        []CompletionItem{},
 		},
 	}
+}
+
+func (s *GMLLanguageServer) handleFormatting(msg *Message) *Message {
+	var params DocumentFormattingParams
+	paramsBytes, err := json.Marshal(msg.Params)
+	if err != nil {
+		return &Message{
+			Jsonrpc: "2.0",
+			ID:      msg.ID,
+			Error: &RPCError{
+				Code:    -32602,
+				Message: "Invalid params for formatting",
+			},
+		}
+	}
+	if err := json.Unmarshal(paramsBytes, &params); err != nil {
+		return &Message{
+			Jsonrpc: "2.0",
+			ID:      msg.ID,
+			Error: &RPCError{
+				Code:    -32602,
+				Message: "Invalid params for formatting",
+			},
+		}
+	}
+
+	// Get document content
+	content, exists := s.documents[params.TextDocument.URI]
+	if !exists {
+		return &Message{Jsonrpc: "2.0", ID: msg.ID, Result: []TextEdit{}}
+	}
+
+	// Format the content
+	formattedContent := s.formatGMLCode(content, params.Options)
+
+	// If no changes needed, return empty array
+	if formattedContent == content {
+		return &Message{Jsonrpc: "2.0", ID: msg.ID, Result: []TextEdit{}}
+	}
+
+	// Calculate the range of the entire document
+	lines := strings.Split(content, "\n")
+	endLine := len(lines) - 1
+	endChar := 0
+	if endLine >= 0 {
+		endChar = len(lines[endLine])
+	}
+
+	// Return a single text edit that replaces the entire document
+	edits := []TextEdit{
+		{
+			Range: Range{
+				Start: Position{Line: 0, Character: 0},
+				End:   Position{Line: endLine, Character: endChar},
+			},
+			NewText: formattedContent,
+		},
+	}
+
+	return &Message{Jsonrpc: "2.0", ID: msg.ID, Result: edits}
+}
+
+func (s *GMLLanguageServer) formatGMLCode(content string, options FormattingOptions) string {
+	lines := strings.Split(content, "\n")
+	var formattedLines []string
+	indentLevel := 0
+
+	// Determine indentation string
+	indentStr := "\t"
+	if options.InsertSpaces {
+		indentStr = strings.Repeat(" ", options.TabSize)
+	}
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Skip empty lines
+		if trimmed == "" {
+			formattedLines = append(formattedLines, "")
+			continue
+		}
+
+		// Handle closing braces and similar constructs
+		if s.shouldDecreaseIndent(trimmed) {
+			indentLevel--
+			if indentLevel < 0 {
+				indentLevel = 0
+			}
+		}
+
+		// Apply current indentation
+		formattedLine := strings.Repeat(indentStr, indentLevel) + trimmed
+
+		// Handle opening braces and similar constructs
+		if s.shouldIncreaseIndent(trimmed) {
+			indentLevel++
+		}
+
+		// Format specific GML constructs
+		formattedLine = s.formatGMLLine(formattedLine)
+
+		formattedLines = append(formattedLines, formattedLine)
+	}
+
+	return strings.Join(formattedLines, "\n")
+}
+
+func (s *GMLLanguageServer) shouldIncreaseIndent(line string) bool {
+	// Patterns that should increase indentation
+	patterns := []string{
+		`{$`,                // Opening brace at end of line
+		`\bif\b.*\)$`,       // if statement without brace
+		`\belse$`,           // else without brace
+		`\bwhile\b.*\)$`,    // while loop without brace
+		`\bfor\b.*\)$`,      // for loop without brace
+		`\brepeat\b.*$`,     // repeat loop
+		`\bwith\b.*\)$`,     // with statement without brace
+		`\bswitch\b.*\)$`,   // switch statement without brace
+		`\bcase\b.*:$`,      // case statement
+		`\bdefault\s*:$`,    // default case
+		`\bfunction\b.*\{$`, // function definition with brace
+		`\benum\b.*\{$`,     // enum definition with brace
+	}
+
+	for _, pattern := range patterns {
+		if matched, _ := regexp.MatchString(pattern, line); matched {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *GMLLanguageServer) shouldDecreaseIndent(line string) bool {
+	// Patterns that should decrease indentation
+	patterns := []string{
+		`^}`,           // Closing brace at start
+		`^\}.*`,        // Closing brace at start with content after
+		`^break;?$`,    // break statement
+		`^continue;?$`, // continue statement
+		`^case\b`,      // case statement (also decreases before increasing)
+		`^default\s*:`, // default case
+	}
+
+	for _, pattern := range patterns {
+		if matched, _ := regexp.MatchString(pattern, line); matched {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *GMLLanguageServer) formatGMLLine(line string) string {
+	// Add spaces around operators
+	line = regexp.MustCompile(`([^=!<>])=([^=])`).ReplaceAllString(line, "$1 = $2")
+	line = regexp.MustCompile(`([^=!<>])==([^=])`).ReplaceAllString(line, "$1 == $2")
+	line = regexp.MustCompile(`([^=!<>])!=([^=])`).ReplaceAllString(line, "$1 != $2")
+	line = regexp.MustCompile(`([^<])<=([^=])`).ReplaceAllString(line, "$1 <= $2")
+	line = regexp.MustCompile(`([^>])>=([^=])`).ReplaceAllString(line, "$1 >= $2")
+	line = regexp.MustCompile(`([^<])<([^=<])`).ReplaceAllString(line, "$1 < $2")
+	line = regexp.MustCompile(`([^>])>([^=>])`).ReplaceAllString(line, "$1 > $2")
+
+	// Add spaces around + and - (but be careful with unary operators)
+	line = regexp.MustCompile(`([a-zA-Z0-9_\)])\+([a-zA-Z0-9_\(])`).ReplaceAllString(line, "$1 + $2")
+	line = regexp.MustCompile(`([a-zA-Z0-9_\)])-([a-zA-Z0-9_\(])`).ReplaceAllString(line, "$1 - $2")
+
+	// Add spaces around * and / and %
+	line = regexp.MustCompile(`([a-zA-Z0-9_\)])\*([a-zA-Z0-9_\(])`).ReplaceAllString(line, "$1 * $2")
+	line = regexp.MustCompile(`([a-zA-Z0-9_\)])/([a-zA-Z0-9_\(])`).ReplaceAllString(line, "$1 / $2")
+	line = regexp.MustCompile(`([a-zA-Z0-9_\)])%([a-zA-Z0-9_\(])`).ReplaceAllString(line, "$1 % $2")
+
+	// Format control structures
+	line = regexp.MustCompile(`\bif\s*\(`).ReplaceAllString(line, "if (")
+	line = regexp.MustCompile(`\bwhile\s*\(`).ReplaceAllString(line, "while (")
+	line = regexp.MustCompile(`\bfor\s*\(`).ReplaceAllString(line, "for (")
+	line = regexp.MustCompile(`\bwith\s*\(`).ReplaceAllString(line, "with (")
+	line = regexp.MustCompile(`\bswitch\s*\(`).ReplaceAllString(line, "switch (")
+
+	// Format function calls (add space after comma)
+	line = regexp.MustCompile(`,([^\s])`).ReplaceAllString(line, ", $1")
+
+	// Remove extra spaces
+	line = regexp.MustCompile(`\s+`).ReplaceAllString(line, " ")
+
+	return line
 }
 
 func main() {
