@@ -327,7 +327,8 @@ func (s *GMLLanguageServer) scanDirectoryForGMLFiles(rootPath string) ([]string,
 
 var (
 	varPattern        = regexp.MustCompile(`\bvar\s+([a-zA-Z_][a-zA-Z0-9_]*)\b`)
-	assignmentPattern = regexp.MustCompile(`\b([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*[^=]`)
+	assignmentPattern = regexp.MustCompile(
+		`\b([a-zA-Z_][a-zA-Z0-9_]*)\s*([+\-*/%&|^]?=|<<=|>>=)\s*[^=]`)
 	funcPattern       = regexp.MustCompile(`\bfunction\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(`)
 	constantPattern   = regexp.MustCompile(`(?:\b#macro\s+|\benum\s+)([a-zA-Z_][a-zA-Z0-9_]*)\b`)
 	objectPattern     = regexp.MustCompile(`\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\.\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=`)
@@ -2251,6 +2252,7 @@ func (s *GMLLanguageServer) formatGMLCode(content string, options FormattingOpti
 	lines := strings.Split(content, "\n")
 	var formattedLines []string
 	indentLevel := 0
+	prevIncreased := false
 
 	// Determine indentation string
 	indentStr := "\t"
@@ -2264,7 +2266,17 @@ func (s *GMLLanguageServer) formatGMLCode(content string, options FormattingOpti
 		// Skip empty lines
 		if trimmed == "" {
 			formattedLines = append(formattedLines, "")
+			prevIncreased = false
 			continue
+		}
+
+		// Undo previous line's increase when this line is a lone
+		// opening brace (Allman style) to avoid double indentation.
+		if prevIncreased && trimmed == "{" {
+			indentLevel--
+			if indentLevel < 0 {
+				indentLevel = 0
+			}
 		}
 
 		// Handle closing braces and similar constructs
@@ -2279,9 +2291,11 @@ func (s *GMLLanguageServer) formatGMLCode(content string, options FormattingOpti
 		formattedLine := strings.Repeat(indentStr, indentLevel) + trimmed
 
 		// Handle opening braces and similar constructs
-		if s.shouldIncreaseIndent(trimmed) {
+		increased := s.shouldIncreaseIndent(trimmed)
+		if increased {
 			indentLevel++
 		}
+		prevIncreased = increased
 
 		// Format specific GML constructs
 		formattedLine = s.formatGMLLine(formattedLine)
@@ -2298,6 +2312,7 @@ func (s *GMLLanguageServer) shouldIncreaseIndent(line string) bool {
 		`{$`,                // Opening brace at end of line
 		`\bif\b.*\)$`,       // if statement without brace
 		`\belse$`,           // else without brace
+		`\belse\b.*\)$`,     // else if ending with )
 		`\bwhile\b.*\)$`,    // while loop without brace
 		`\bfor\b.*\)$`,      // for loop without brace
 		`\brepeat\b.*$`,     // repeat loop
@@ -2305,6 +2320,7 @@ func (s *GMLLanguageServer) shouldIncreaseIndent(line string) bool {
 		`\bswitch\b.*\)$`,   // switch statement without brace
 		`\bcase\b.*:$`,      // case statement
 		`\bdefault\s*:$`,    // default case
+		`\bfunction\b.*\)$`, // function definition without brace
 		`\bfunction\b.*\{$`, // function definition with brace
 		`\benum\b.*\{$`,     // enum definition with brace
 	}
@@ -2336,39 +2352,340 @@ func (s *GMLLanguageServer) shouldDecreaseIndent(line string) bool {
 	return false
 }
 
+type lineTokenKind int
+
+const (
+	tokString lineTokenKind = iota
+	tokComment
+	tokNumber
+	tokIdentifier
+	tokOperator
+	tokPunct
+)
+
+type lineToken struct {
+	kind lineTokenKind
+	text string
+}
+
+func tokenizeLine(line string) []lineToken {
+	var tokens []lineToken
+	i := 0
+	runes := []rune(line)
+	n := len(runes)
+
+	for i < n {
+		// Skip whitespace between tokens
+		if runes[i] == ' ' || runes[i] == '\t' {
+			i++
+			continue
+		}
+
+		rest := string(runes[i:])
+
+		// String literals
+		if runes[i] == '"' {
+			j := i + 1
+			for j < n {
+				if runes[j] == '\\' {
+					j += 2
+					continue
+				}
+				if runes[j] == '"' {
+					j++
+					break
+				}
+				j++
+			}
+			tokens = append(tokens, lineToken{
+				kind: tokString,
+				text: string(runes[i:j]),
+			})
+			i = j
+			continue
+		}
+		if runes[i] == '\'' {
+			j := i + 1
+			for j < n {
+				if runes[j] == '\\' {
+					j += 2
+					continue
+				}
+				if runes[j] == '\'' {
+					j++
+					break
+				}
+				j++
+			}
+			tokens = append(tokens, lineToken{
+				kind: tokString,
+				text: string(runes[i:j]),
+			})
+			i = j
+			continue
+		}
+
+		// Comments
+		if strings.HasPrefix(rest, "//") {
+			tokens = append(tokens, lineToken{
+				kind: tokComment,
+				text: rest,
+			})
+			i = n
+			continue
+		}
+		if strings.HasPrefix(rest, "/*") {
+			j := i + 2
+			for j+1 < n {
+				if runes[j] == '*' && runes[j+1] == '/' {
+					j += 2
+					break
+				}
+				j++
+			}
+			tokens = append(tokens, lineToken{
+				kind: tokComment,
+				text: string(runes[i:j]),
+			})
+			i = j
+			continue
+		}
+
+		// Numbers
+		if runes[i] >= '0' && runes[i] <= '9' {
+			if strings.HasPrefix(rest, "0x") || strings.HasPrefix(rest, "0X") {
+				j := i + 2
+				for j < n && ((runes[j] >= '0' && runes[j] <= '9') ||
+					(runes[j] >= 'a' && runes[j] <= 'f') ||
+					(runes[j] >= 'A' && runes[j] <= 'F')) {
+					j++
+				}
+				tokens = append(tokens, lineToken{
+					kind: tokNumber,
+					text: string(runes[i:j]),
+				})
+				i = j
+				continue
+			}
+			j := i
+			for j < n && runes[j] >= '0' && runes[j] <= '9' {
+				j++
+			}
+			if j < n && runes[j] == '.' {
+				j++
+				for j < n && runes[j] >= '0' && runes[j] <= '9' {
+					j++
+				}
+			}
+			tokens = append(tokens, lineToken{
+				kind: tokNumber,
+				text: string(runes[i:j]),
+			})
+			i = j
+			continue
+		}
+
+		// Identifiers and keywords
+		if (runes[i] >= 'a' && runes[i] <= 'z') ||
+			(runes[i] >= 'A' && runes[i] <= 'Z') ||
+			runes[i] == '_' {
+			j := i
+			for j < n && ((runes[j] >= 'a' && runes[j] <= 'z') ||
+				(runes[j] >= 'A' && runes[j] <= 'Z') ||
+				(runes[j] >= '0' && runes[j] <= '9') ||
+				runes[j] == '_') {
+				j++
+			}
+			tokens = append(tokens, lineToken{
+				kind: tokIdentifier,
+				text: string(runes[i:j]),
+			})
+			i = j
+			continue
+		}
+
+		// Multi-char operators
+		multiOps := []string{
+			"<<=", ">>=", "+=", "-=", "*=", "/=", "%=",
+			"&=", "|=", "^=", "==", "!=", "<=", ">=",
+			"<<", ">>", "++", "--", "&&", "||",
+		}
+		matched := false
+		for _, op := range multiOps {
+			if strings.HasPrefix(rest, op) {
+				tokens = append(tokens, lineToken{
+					kind: tokOperator,
+					text: op,
+				})
+				i += len([]rune(op))
+				matched = true
+				break
+			}
+		}
+		if matched {
+			continue
+		}
+
+		// Single-char operators
+		singleOps := "+-*/%=<>!&|^~"
+		if strings.ContainsRune(singleOps, runes[i]) {
+			tokens = append(tokens, lineToken{
+				kind: tokOperator,
+				text: string(runes[i]),
+			})
+			i++
+			continue
+		}
+
+		// Punctuation
+		if strings.ContainsRune("(){}[],;:.", runes[i]) {
+			tokens = append(tokens, lineToken{
+				kind: tokPunct,
+				text: string(runes[i]),
+			})
+			i++
+			continue
+		}
+
+		// Skip any unrecognized character
+		i++
+	}
+
+	return tokens
+}
+
+var controlFlowKeywords = map[string]bool{
+	"if": true, "while": true, "for": true, "repeat": true,
+	"with": true, "switch": true, "catch": true,
+}
+
+func isValueKind(kind lineTokenKind) bool {
+	return kind == tokIdentifier || kind == tokNumber ||
+		kind == tokString
+}
+
 func (s *GMLLanguageServer) formatGMLLine(line string) string {
-	// Add spaces around operators
-	line = regexp.MustCompile(`([^=!<>])=([^=])`).ReplaceAllString(line, "$1 = $2")
-	line = regexp.MustCompile(`([^=!<>])==([^=])`).ReplaceAllString(line, "$1 == $2")
-	line = regexp.MustCompile(`([^=!<>])!=([^=])`).ReplaceAllString(line, "$1 != $2")
-	line = regexp.MustCompile(`([^<])<=([^=])`).ReplaceAllString(line, "$1 <= $2")
-	line = regexp.MustCompile(`([^>])>=([^=])`).ReplaceAllString(line, "$1 >= $2")
-	line = regexp.MustCompile(`([^<])<([^=<])`).ReplaceAllString(line, "$1 < $2")
-	line = regexp.MustCompile(`([^>])>([^=>])`).ReplaceAllString(line, "$1 > $2")
+	var indent string
+	for _, r := range line {
+		if r == ' ' || r == '\t' {
+			indent += string(r)
+		} else {
+			break
+		}
+	}
+	trimmed := strings.TrimLeft(line, " \t")
 
-	// Add spaces around + and - (but be careful with unary operators)
-	line = regexp.MustCompile(`([a-zA-Z0-9_\)])\+([a-zA-Z0-9_\(])`).ReplaceAllString(line, "$1 + $2")
-	line = regexp.MustCompile(`([a-zA-Z0-9_\)])-([a-zA-Z0-9_\(])`).ReplaceAllString(line, "$1 - $2")
+	tokens := tokenizeLine(trimmed)
+	if len(tokens) == 0 {
+		return line
+	}
 
-	// Add spaces around * and / and %
-	line = regexp.MustCompile(`([a-zA-Z0-9_\)])\*([a-zA-Z0-9_\(])`).ReplaceAllString(line, "$1 * $2")
-	line = regexp.MustCompile(`([a-zA-Z0-9_\)])/([a-zA-Z0-9_\(])`).ReplaceAllString(line, "$1 / $2")
-	line = regexp.MustCompile(`([a-zA-Z0-9_\)])%([a-zA-Z0-9_\(])`).ReplaceAllString(line, "$1 % $2")
+	var out strings.Builder
 
-	// Format control structures
-	line = regexp.MustCompile(`\bif\s*\(`).ReplaceAllString(line, "if (")
-	line = regexp.MustCompile(`\bwhile\s*\(`).ReplaceAllString(line, "while (")
-	line = regexp.MustCompile(`\bfor\s*\(`).ReplaceAllString(line, "for (")
-	line = regexp.MustCompile(`\bwith\s*\(`).ReplaceAllString(line, "with (")
-	line = regexp.MustCompile(`\bswitch\s*\(`).ReplaceAllString(line, "switch (")
+	for idx, tok := range tokens {
+		prevIdx := idx - 1
+		for prevIdx >= 0 && tokens[prevIdx].kind == tokComment {
+			prevIdx--
+		}
+		var prev *lineToken
+		if prevIdx >= 0 {
+			prev = &tokens[prevIdx]
+		}
+		nextIdx := idx + 1
+		for nextIdx < len(tokens) && tokens[nextIdx].kind == tokComment {
+			nextIdx++
+		}
+		var next *lineToken
+		if nextIdx < len(tokens) {
+			next = &tokens[nextIdx]
+		}
 
-	// Format function calls (add space after comma)
-	line = regexp.MustCompile(`,([^\s])`).ReplaceAllString(line, ", $1")
+		if tok.kind == tokComment || tok.kind == tokString {
+			if tok.kind == tokComment && out.Len() > 0 {
+				out.WriteString(" ")
+			}
+			out.WriteString(tok.text)
+			continue
+		}
 
-	// Remove extra spaces
-	line = regexp.MustCompile(`\s+`).ReplaceAllString(line, " ")
+		needsLeadingSpace := false
+		needsTrailingSpace := false
 
-	return line
+		if tok.kind == tokOperator {
+			switch tok.text {
+			case "++", "--":
+			case ".":
+			case "-", "+":
+				isUnary := prev == nil ||
+					(prev.kind == tokOperator &&
+						prev.text != "++" && prev.text != "--" &&
+						prev.text != ")" && prev.text != "]" &&
+						!isValueKind(prev.kind)) ||
+					prev.text == "(" || prev.text == "," ||
+					prev.text == ";" || prev.text == ":"
+				if !isUnary {
+					needsLeadingSpace = true
+					needsTrailingSpace = true
+				}
+			default:
+				needsLeadingSpace = true
+				needsTrailingSpace = true
+			}
+		}
+
+		if tok.kind == tokPunct {
+			switch tok.text {
+			case ",":
+				needsTrailingSpace = true
+			case ";":
+				needsTrailingSpace = true
+			case "(":
+				if prev != nil && prev.kind == tokIdentifier &&
+					!controlFlowKeywords[prev.text] {
+				} else if prev != nil && prev.kind == tokIdentifier &&
+					controlFlowKeywords[prev.text] {
+					needsLeadingSpace = true
+				}
+			case ")":
+			case "}":
+				needsTrailingSpace = true
+			case "{":
+				if prev != nil && (prev.text == ")" ||
+					prev.text == "]" || isValueKind(prev.kind)) {
+					needsLeadingSpace = true
+				}
+			case ".":
+			}
+		}
+
+		if tok.kind == tokIdentifier || tok.kind == tokNumber {
+			if prev != nil && isValueKind(prev.kind) {
+				needsLeadingSpace = true
+			}
+		}
+
+		if needsLeadingSpace && out.Len() > 0 {
+			last := out.String()[out.Len()-1]
+			if last != ' ' {
+				out.WriteString(" ")
+			}
+		}
+
+		out.WriteString(tok.text)
+
+		if needsTrailingSpace && next != nil {
+			out.WriteString(" ")
+		}
+	}
+
+	content := out.String()
+	content = regexp.MustCompile(`\s+([,;\)\]])`).ReplaceAllString(
+		content, "$1")
+	content = regexp.MustCompile(`(\(\s+)`).ReplaceAllString(
+		content, "(")
+	content = regexp.MustCompile(`\s{2,}`).ReplaceAllString(content, " ")
+
+	return indent + content
 }
 
 func main() {
