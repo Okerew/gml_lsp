@@ -1,4 +1,4 @@
-module gml-lsp
+module gml_lsp
 
 go 1.19
 
